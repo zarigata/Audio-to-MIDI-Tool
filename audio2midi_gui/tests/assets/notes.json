@@ -1,0 +1,23 @@
+[
+    {
+        "onset_s": 0.0,
+        "offset_s": 0.5,
+        "pitch_midi": 60,
+        "velocity": 0.8,
+        "track_name": "piano"
+    },
+    {
+        "onset_s": 0.5,
+        "offset_s": 1.0,
+        "pitch_midi": 62,
+        "velocity": 0.7,
+        "track_name": "piano"
+    },
+    {
+        "onset_s": 1.0,
+        "offset_s": 1.5,
+        "pitch_midi": 64,
+        "velocity": 0.9,
+        "track_name": "guitar"
+    }
+]

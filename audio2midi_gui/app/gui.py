@@ -4,6 +4,8 @@
 import sys
 import os
 import json
+import logging
+from datetime import datetime
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -17,12 +19,119 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 import librosa
 import pygame.midi
+import multiprocessing as mp
 from backend.separation import separate
 from backend.instrument_detect import analyze_stem, choose_transcription_model
 from backend.transcribe import transcribe_stem_to_midi
 from backend.midi_writer import write_midi_from_notes
 
 SETTINGS_FILE = Path.home() / "audio2midi_settings.json"
+LOGS_DIR = Path("logs")
+
+# Debug logging
+DEBUG = os.environ.get('DEBUG', '0') == '1'
+if DEBUG:
+    logging.basicConfig(filename=LOGS_DIR / f"debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+                        level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class JobQueue:
+    def __init__(self):
+        self.queue = []
+        self.running = False
+
+    def add_job(self, func, *args, callback=None):
+        self.queue.append((func, args, callback))
+
+    def start(self):
+        if not self.running:
+            self.running = True
+            self.process_next()
+
+    def process_next(self):
+        if self.queue:
+            func, args, callback = self.queue.pop(0)
+            worker = WorkerThread(func, *args)
+            worker.finished.connect(lambda result: self.on_job_done(result, callback))
+            worker.start()
+        else:
+            self.running = False
+
+    def on_job_done(self, result, callback):
+        if callback:
+            callback(result)
+        self.process_next()
+
+    def cancel(self):
+        self.queue.clear()
+        self.running = False
+
+class Orchestrator:
+    def __init__(self, gui):
+        self.gui = gui
+        self.pool = mp.Pool(mp.cpu_count())
+        self.gpu_lock = mp.Lock()
+
+    def transcribe_all_stems(self, stems, model, device):
+        results = []
+        gpu_jobs = []
+        cpu_jobs = []
+
+        for stem in stems:
+            stem_path = stem['path']
+            midi_path = Path(stem_path).with_suffix('.mid')
+            if midi_path.exists() and not self.gui.force_rerun:
+                self.gui.log(f"Cached: {midi_path}")
+                continue
+
+            instrument = self.detect_instrument(stem_path)
+            trans_model = choose_transcription_model({'instrument': instrument})
+
+            if trans_model in ['mt3', 'onsets_frames'] and device == 'cuda':
+                gpu_jobs.append((stem_path, instrument, model, device))
+            else:
+                cpu_jobs.append((stem_path, instrument, model, device))
+
+        # Run GPU jobs serially
+        for job in gpu_jobs:
+            result = self.transcribe_single(*job)
+            results.append(result)
+
+        # Run CPU jobs in parallel
+        if cpu_jobs:
+            cpu_results = self.pool.map(self.transcribe_single, cpu_jobs)
+            results.extend(cpu_results)
+
+        return results
+
+    def transcribe_single(self, stem_path, instrument, model, device):
+        try:
+            midi_path, summary = transcribe_stem_to_midi(stem_path, instrument_hint=instrument, model=model, device=device)
+            return summary
+        except Exception as e:
+            logging.error(f"Transcription failed for {stem_path}: {e}", exc_info=True)
+            return None
+
+    def detect_instruments(self, stems):
+        return [self.detect_instrument(stem['path']) for stem in stems]
+
+class WorkerThread(QThread):
+    progress = Signal(int)
+    log = Signal(str)
+    finished = Signal(object)
+
+    def __init__(self, func, *args):
+        super().__init__()
+        self.func = func
+        self.args = args
+
+    def run(self):
+        try:
+            result = self.func(*self.args)
+            self.finished.emit(result)
+        except Exception as e:
+            self.log.emit(f"Error: {e}")
+            if DEBUG:
+                logging.exception("Worker error")
 
 class WorkerThread(QThread):
     progress = Signal(int)
@@ -48,6 +157,9 @@ class Audio2MIDIGUI(QMainWindow):
         self.audio_path = None
         self.stems = []
         self.midis = {}
+        self.force_rerun = False
+        self.job_queue = JobQueue()
+        self.orchestrator = Orchestrator(self)
         self.setAcceptDrops(True)
         self.init_ui()
         self.init_midi()
@@ -121,6 +233,9 @@ class Audio2MIDIGUI(QMainWindow):
         options_layout.addWidget(QLabel("Quality:"))
         options_layout.addWidget(self.quality_slider)
 
+        self.force_rerun_check = QCheckBox("Force Re-run")
+        options_layout.addWidget(self.force_rerun_check)
+
         layout.addWidget(options_group)
 
         # Buttons
@@ -132,6 +247,10 @@ class Audio2MIDIGUI(QMainWindow):
         analyze_btn = QPushButton("Analyze")
         analyze_btn.clicked.connect(self.analyze_stems)
         btn_layout.addWidget(analyze_btn)
+
+        trans_btn = QPushButton("Transcribe All")
+        trans_btn.clicked.connect(self.transcribe_all)
+        btn_layout.addWidget(trans_btn)
 
         layout.addLayout(btn_layout)
 
@@ -184,37 +303,50 @@ class Audio2MIDIGUI(QMainWindow):
             return
         out_dir = Path(self.audio_path).parent / "stems"
         device = self.device_combo.currentText()
-        self.run_worker(separate, self.audio_path, str(out_dir), device=device)
+        self.job_queue.add_job(separate, self.audio_path, str(out_dir), device=device, callback=self.on_separation_done)
+        self.job_queue.start()
 
-    def analyze_stems(self):
-        # Placeholder
-        self.log("Analyzing stems...")
-
-    def run_worker(self, func, *args):
-        self.worker = WorkerThread(func, *args)
-        self.worker.progress.connect(self.progress_bar.setValue)
-        self.worker.log.connect(self.log)
-        self.worker.finished.connect(self.on_worker_finished)
-        self.worker.start()
-
-    def on_worker_finished(self, result):
-        if isinstance(result, list):  # Summary from separation
+    def on_separation_done(self, result):
+        if isinstance(result, list):
             self.stems = result
             self.update_stems_list()
 
-    def update_stems_list(self):
-        self.stems_list.clear()
-        for stem in self.stems:
-            item = QListWidgetItem(f"{Path(stem['path']).name}")
-            self.stems_list.addItem(item)
+    def transcribe_all(self):
+        if not self.stems:
+            return
+        model = self.trans_combo.currentText()
+        device = self.device_combo.currentText()
+        self.force_rerun = self.force_rerun_check.isChecked()
+        self.job_queue.add_job(self.orchestrator.transcribe_all_stems, self.stems, model, device, callback=self.on_transcription_done)
+        self.job_queue.start()
 
-    def export_midi(self):
-        # Placeholder
-        pass
+    def on_transcription_done(self, results):
+        # results is list of summaries
+        for res in results:
+            if res:
+                self.log(f"Transcribed: {res['midi_path']}")
+
+    def cancel_job(self):
+        self.job_queue.cancel()
+
+    def analyze_stems(self):
+        if not self.stems:
+            return
+        self.job_queue.add_job(self.orchestrator.detect_instruments, self.stems, callback=self.on_analysis_done)
+        self.job_queue.start()
+
+    def on_analysis_done(self, instruments):
+        for stem, inst in zip(self.stems, instruments):
+            stem['instrument'] = inst
+        self.log("Analysis complete")
 
     def cancel_job(self):
         if hasattr(self, 'worker'):
             self.worker.terminate()
+
+    def export_midi(self):
+        # Placeholder
+        pass
 
     def log(self, msg):
         self.log_text.append(msg)
